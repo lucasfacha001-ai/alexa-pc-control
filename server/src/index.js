@@ -11,6 +11,14 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 
 const devices = new Map();
 
+function now() {
+  return new Date().toISOString();
+}
+
+function log(...args) {
+  console.log(`[${now()}]`, ...args);
+}
+
 function alexaResponse(text) {
   return {
     version: "1.0",
@@ -24,72 +32,181 @@ function alexaResponse(text) {
   };
 }
 
+function safeJson(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "[unserializable]";
+  }
+}
+
 function sendToPC(command) {
   const deviceId = process.env.DEFAULT_DEVICE_ID || "pc-casa";
   const ws = devices.get(deviceId);
 
-  if (!ws || ws.readyState !== 1) return false;
+  log("sendToPC called", {
+    targetDeviceId: deviceId,
+    command,
+    hasSocket: !!ws,
+    readyState: ws ? ws.readyState : null
+  });
 
-  ws.send(JSON.stringify(command));
-  return true;
+  if (!ws || ws.readyState !== 1) {
+    log("sendToPC failed: computer not connected", {
+      targetDeviceId: deviceId
+    });
+    return false;
+  }
+
+  try {
+    ws.send(JSON.stringify(command));
+    log("sendToPC success", { targetDeviceId: deviceId, command });
+    return true;
+  } catch (err) {
+    log("sendToPC error", err.message);
+    return false;
+  }
 }
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
   const deviceId = url.searchParams.get("deviceId");
   const token = url.searchParams.get("token");
+  const expectedToken = process.env.AGENT_TOKEN;
 
-  if (!deviceId || token !== process.env.AGENT_TOKEN) {
-    ws.close();
+  log("WS connection attempt", {
+    path: req.url,
+    deviceId,
+    tokenReceived: token,
+    expectedToken,
+    remoteAddress: req.socket?.remoteAddress || null
+  });
+
+  if (!deviceId) {
+    log("WS rejected: missing deviceId");
+    ws.close(1008, "missing deviceId");
+    return;
+  }
+
+  if (!expectedToken) {
+    log("WS rejected: server AGENT_TOKEN missing");
+    ws.close(1011, "server token missing");
+    return;
+  }
+
+  if (token !== expectedToken) {
+    log("WS rejected: invalid token", {
+      deviceId,
+      tokenReceived: token,
+      expectedToken
+    });
+    ws.close(1008, "invalid token");
     return;
   }
 
   ws.isAlive = true;
   devices.set(deviceId, ws);
 
-  console.log("PC conectada:", deviceId);
+  log("PC connected", {
+    deviceId,
+    totalConnectedDevices: devices.size
+  });
 
-  ws.on("pong", () => (ws.isAlive = true));
+  ws.on("pong", () => {
+    ws.isAlive = true;
+    log("WS pong received", { deviceId });
+  });
 
-  ws.on("close", () => {
+  ws.on("message", (data) => {
+    log("WS message from PC", {
+      deviceId,
+      data: data.toString()
+    });
+  });
+
+  ws.on("close", (code, reason) => {
     devices.delete(deviceId);
-    console.log("PC desconectada:", deviceId);
+    log("PC disconnected", {
+      deviceId,
+      code,
+      reason: reason.toString(),
+      totalConnectedDevices: devices.size
+    });
+  });
+
+  ws.on("error", (err) => {
+    log("WS error", {
+      deviceId,
+      message: err.message
+    });
   });
 });
 
 setInterval(() => {
   for (const [id, ws] of devices.entries()) {
-    if (!ws.isAlive) {
+    if (ws.isAlive === false) {
+      log("WS stale connection terminated", { deviceId: id });
       ws.terminate();
       devices.delete(id);
       continue;
     }
+
     ws.isAlive = false;
+    log("WS ping sent", { deviceId: id });
     ws.ping();
   }
 }, 30000);
 
 app.get("/", (_req, res) => {
+  log("GET /");
   res.send("SERVER OK");
+});
+
+app.get("/alexa", (_req, res) => {
+  log("GET /alexa");
+  res.send("ALEXA ENDPOINT OK");
 });
 
 app.post("/alexa", (req, res) => {
   try {
+    log("POST /alexa received");
+    log("Headers:", safeJson(req.headers));
+    log("Body:", safeJson(req.body));
+
     const body = req.body;
+    const requestType = body?.request?.type;
     const intent = body?.request?.intent?.name;
 
-    if (body.request.type === "LaunchRequest") {
+    log("Alexa parsed request", {
+      requestType,
+      intent
+    });
+
+    if (!body || !body.request) {
+      log("Invalid Alexa request: missing body.request");
+      return res.json(alexaResponse("Invalid request"));
+    }
+
+    if (requestType === "LaunchRequest") {
+      log("Handling LaunchRequest");
       return res.json(
         alexaResponse("Ready to control your computer.")
       );
     }
 
     if (intent === "OpenAppIntent") {
-      const appName = body.request.intent.slots?.app?.value;
+      const appName = body.request.intent.slots?.app?.value || null;
+      const monitor = body.request.intent.slots?.monitor?.value || null;
+
+      log("Handling OpenAppIntent", {
+        appName,
+        monitor
+      });
 
       const ok = sendToPC({
         type: "open_app",
-        app: appName
+        app: appName,
+        monitor
       });
 
       return res.json(
@@ -100,11 +217,18 @@ app.post("/alexa", (req, res) => {
     }
 
     if (intent === "OpenWebsiteIntent") {
-      const site = body.request.intent.slots?.site?.value;
+      const site = body.request.intent.slots?.site?.value || null;
+      const monitor = body.request.intent.slots?.monitor?.value || null;
+
+      log("Handling OpenWebsiteIntent", {
+        site,
+        monitor
+      });
 
       const ok = sendToPC({
         type: "open_website",
-        site
+        site,
+        monitor
       });
 
       return res.json(
@@ -115,7 +239,11 @@ app.post("/alexa", (req, res) => {
     }
 
     if (intent === "VolumeIntent") {
-      const action = body.request.intent.slots?.action?.value;
+      const action = body.request.intent.slots?.action?.value || null;
+
+      log("Handling VolumeIntent", {
+        action
+      });
 
       const ok = sendToPC({
         type: "volume",
@@ -123,21 +251,61 @@ app.post("/alexa", (req, res) => {
       });
 
       return res.json(
-        alexaResponse(ok ? `Volume ${action}` : "Computer not connected")
+        alexaResponse(
+          ok ? `Volume ${action}` : "Computer not connected"
+        )
       );
     }
 
     if (intent === "LockComputerIntent") {
-      const ok = sendToPC({ type: "lock_pc" });
+      log("Handling LockComputerIntent");
+
+      const ok = sendToPC({
+        type: "lock_pc"
+      });
 
       return res.json(
-        alexaResponse(ok ? "Locking computer" : "Computer not connected")
+        alexaResponse(
+          ok ? "Locking computer" : "Computer not connected"
+        )
       );
     }
 
+    if (intent === "SleepComputerIntent") {
+      log("Handling SleepComputerIntent");
+
+      const ok = sendToPC({
+        type: "sleep_pc"
+      });
+
+      return res.json(
+        alexaResponse(
+          ok ? "Putting computer to sleep" : "Computer not connected"
+        )
+      );
+    }
+
+    if (intent === "ShutdownComputerIntent") {
+      log("Handling ShutdownComputerIntent");
+
+      const ok = sendToPC({
+        type: "shutdown_pc"
+      });
+
+      return res.json(
+        alexaResponse(
+          ok ? "Shutting down computer" : "Computer not connected"
+        )
+      );
+    }
+
+    log("Unhandled intent", { intent });
     return res.json(alexaResponse("Command not understood"));
   } catch (e) {
-    console.error(e);
+    log("POST /alexa error", {
+      message: e.message,
+      stack: e.stack
+    });
     return res.json(alexaResponse("Error"));
   }
 });
@@ -145,5 +313,9 @@ app.post("/alexa", (req, res) => {
 const PORT = process.env.PORT || 10000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Server running on", PORT);
+  log("Server running", {
+    port: PORT,
+    defaultDeviceId: process.env.DEFAULT_DEVICE_ID || "pc-casa",
+    hasAgentToken: !!process.env.AGENT_TOKEN
+  });
 });
