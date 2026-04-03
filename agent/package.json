@@ -1,0 +1,13 @@
+{
+  "name": "pc-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/agent.js",
+  "scripts": {
+    "start": "node src/agent.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "open": "^10.1.0"
+  }
+}
