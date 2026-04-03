@@ -1,42 +1,108 @@
 import { exec } from "child_process";
 import open from "open";
 
-function run(cmd) {
-  return new Promise((res, rej) => {
-    exec(cmd, (e, out) => (e ? rej(e) : res(out)));
+function run(command) {
+  return new Promise((resolve, reject) => {
+    exec(command, { windowsHide: true }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`${error.message} | stderr: ${stderr}`));
+        return;
+      }
+
+      resolve({
+        command,
+        stdout: stdout?.trim() || "",
+        stderr: stderr?.trim() || ""
+      });
+    });
   });
 }
 
-function getUrl(site) {
-  const s = site.toLowerCase();
-
-  if (s.includes("youtube")) return "https://youtube.com";
-  if (s.includes("google")) return "https://google.com";
-  if (s.includes("netflix")) return "https://netflix.com";
-
-  return "https://" + s;
+function normalizeAppName(app) {
+  return (app || "").toLowerCase().trim();
 }
 
-export async function handleCommand(cmd) {
-  switch (cmd.type) {
-    case "open_app":
-      if (cmd.app.includes("chrome")) return run('start "" chrome');
-      if (cmd.app.includes("spotify")) return run('start "" spotify');
-      return;
+function siteToUrl(site) {
+  const value = (site || "").toLowerCase().trim();
 
-    case "open_website":
-      return open(getUrl(cmd.site));
+  if (value.includes("youtube")) return "https://www.youtube.com";
+  if (value.includes("google")) return "https://www.google.com";
+  if (value.includes("gmail")) return "https://mail.google.com";
+  if (value.includes("netflix")) return "https://www.netflix.com";
+  if (value.includes("twitch")) return "https://www.twitch.tv";
 
-    case "volume":
-      if (cmd.action.includes("up"))
-        return run('powershell (new-object -com wscript.shell).sendkeys([char]175)');
-      if (cmd.action.includes("down"))
-        return run('powershell (new-object -com wscript.shell).sendkeys([char]174)');
-      if (cmd.action.includes("mute"))
-        return run('powershell (new-object -com wscript.shell).sendkeys([char]173)');
-      return;
+  if (value.startsWith("http://") || value.startsWith("https://")) {
+    return value;
+  }
 
-    case "lock_pc":
-      return run("rundll32.exe user32.dll,LockWorkStation");
+  return `https://${value}`;
+}
+
+export async function handleCommand(command) {
+  switch (command.type) {
+    case "open_app": {
+      const app = normalizeAppName(command.app);
+
+      if (app.includes("chrome")) {
+        return await run('start "" chrome');
+      }
+
+      if (app.includes("spotify")) {
+        return await run('start "" spotify');
+      }
+
+      if (app.includes("bloc de notas") || app.includes("notepad")) {
+        return await run('start "" notepad');
+      }
+
+      if (app.includes("discord")) {
+        return await run('start "" discord');
+      }
+
+      if (app.includes("steam")) {
+        return await run('start "" steam');
+      }
+
+      throw new Error(`Unsupported app: ${command.app}`);
+    }
+
+    case "open_website": {
+      const url = siteToUrl(command.site);
+      await open(url);
+      return { openedUrl: url };
+    }
+
+    case "volume": {
+      const action = (command.action || "").toLowerCase();
+
+      if (action === "up") {
+        return await run('powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]175)"');
+      }
+
+      if (action === "down") {
+        return await run('powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]174)"');
+      }
+
+      if (action === "mute") {
+        return await run('powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]173)"');
+      }
+
+      throw new Error(`Unsupported volume action: ${command.action}`);
+    }
+
+    case "lock_pc": {
+      return await run("rundll32.exe user32.dll,LockWorkStation");
+    }
+
+    case "sleep_pc": {
+      return await run('powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState(\'Suspend\', $false, $false)"');
+    }
+
+    case "shutdown_pc": {
+      return await run("shutdown /s /t 0");
+    }
+
+    default:
+      throw new Error(`Unsupported command type: ${command.type}`);
   }
 }

@@ -40,11 +40,21 @@ function safeJson(value) {
   }
 }
 
+function normalizeVolumeAction(action) {
+  const value = (action || "").toLowerCase();
+
+  if (["sube", "subir", "aumenta", "aumentar"].includes(value)) return "up";
+  if (["baja", "bajar", "reduce", "reducir"].includes(value)) return "down";
+  if (["silencia", "silenciar", "mutea", "mutear", "mudo"].includes(value)) return "mute";
+
+  return value;
+}
+
 function sendToPC(command) {
   const deviceId = process.env.DEFAULT_DEVICE_ID || "pc-casa";
   const ws = devices.get(deviceId);
 
-  log("sendToPC called", {
+  log("sendToPC", {
     targetDeviceId: deviceId,
     command,
     hasSocket: !!ws,
@@ -184,21 +194,21 @@ app.post("/alexa", (req, res) => {
 
     if (!body || !body.request) {
       log("Invalid Alexa request: missing body.request");
-      return res.json(alexaResponse("Invalid request"));
+      return res.json(alexaResponse("Solicitud invalida"));
     }
 
     if (requestType === "LaunchRequest") {
       log("Handling LaunchRequest");
       return res.json(
-        alexaResponse("Ready to control your computer.")
+        alexaResponse("Lista para controlar tu computadora.")
       );
     }
 
-    if (intent === "OpenAppIntent") {
+    if (intent === "AbrirAplicacionIntent") {
       const appName = body.request.intent.slots?.app?.value || null;
       const monitor = body.request.intent.slots?.monitor?.value || null;
 
-      log("Handling OpenAppIntent", {
+      log("Handling AbrirAplicacionIntent", {
         appName,
         monitor
       });
@@ -211,16 +221,16 @@ app.post("/alexa", (req, res) => {
 
       return res.json(
         alexaResponse(
-          ok ? `Opening ${appName}` : "Computer not connected"
+          ok ? `Abriendo ${appName}` : "La computadora no esta conectada"
         )
       );
     }
 
-    if (intent === "OpenWebsiteIntent") {
+    if (intent === "AbrirSitioIntent") {
       const site = body.request.intent.slots?.site?.value || null;
       const monitor = body.request.intent.slots?.monitor?.value || null;
 
-      log("Handling OpenWebsiteIntent", {
+      log("Handling AbrirSitioIntent", {
         site,
         monitor
       });
@@ -233,15 +243,17 @@ app.post("/alexa", (req, res) => {
 
       return res.json(
         alexaResponse(
-          ok ? `Opening ${site}` : "Computer not connected"
+          ok ? `Abriendo ${site}` : "La computadora no esta conectada"
         )
       );
     }
 
-    if (intent === "VolumeIntent") {
-      const action = body.request.intent.slots?.action?.value || null;
+    if (intent === "VolumenIntent") {
+      const actionRaw = body.request.intent.slots?.action?.value || null;
+      const action = normalizeVolumeAction(actionRaw);
 
-      log("Handling VolumeIntent", {
+      log("Handling VolumenIntent", {
+        actionRaw,
         action
       });
 
@@ -252,13 +264,13 @@ app.post("/alexa", (req, res) => {
 
       return res.json(
         alexaResponse(
-          ok ? `Volume ${action}` : "Computer not connected"
+          ok ? `Volumen ${actionRaw}` : "La computadora no esta conectada"
         )
       );
     }
 
-    if (intent === "LockComputerIntent") {
-      log("Handling LockComputerIntent");
+    if (intent === "BloquearComputadoraIntent") {
+      log("Handling BloquearComputadoraIntent");
 
       const ok = sendToPC({
         type: "lock_pc"
@@ -266,13 +278,13 @@ app.post("/alexa", (req, res) => {
 
       return res.json(
         alexaResponse(
-          ok ? "Locking computer" : "Computer not connected"
+          ok ? "Bloqueando la computadora" : "La computadora no esta conectada"
         )
       );
     }
 
-    if (intent === "SleepComputerIntent") {
-      log("Handling SleepComputerIntent");
+    if (intent === "SuspenderComputadoraIntent") {
+      log("Handling SuspenderComputadoraIntent");
 
       const ok = sendToPC({
         type: "sleep_pc"
@@ -280,13 +292,13 @@ app.post("/alexa", (req, res) => {
 
       return res.json(
         alexaResponse(
-          ok ? "Putting computer to sleep" : "Computer not connected"
+          ok ? "Suspendiendo la computadora" : "La computadora no esta conectada"
         )
       );
     }
 
-    if (intent === "ShutdownComputerIntent") {
-      log("Handling ShutdownComputerIntent");
+    if (intent === "ApagarComputadoraIntent") {
+      log("Handling ApagarComputadoraIntent");
 
       const ok = sendToPC({
         type: "shutdown_pc"
@@ -294,19 +306,19 @@ app.post("/alexa", (req, res) => {
 
       return res.json(
         alexaResponse(
-          ok ? "Shutting down computer" : "Computer not connected"
+          ok ? "Apagando la computadora" : "La computadora no esta conectada"
         )
       );
     }
 
     log("Unhandled intent", { intent });
-    return res.json(alexaResponse("Command not understood"));
+    return res.json(alexaResponse("No entendi ese comando"));
   } catch (e) {
     log("POST /alexa error", {
       message: e.message,
       stack: e.stack
     });
-    return res.json(alexaResponse("Error"));
+    return res.json(alexaResponse("Ocurrio un error"));
   }
 });
 
