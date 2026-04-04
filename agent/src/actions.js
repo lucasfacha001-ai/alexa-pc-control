@@ -1,4 +1,4 @@
-import { exec, execFile } from "child_process";
+import { exec, execFile, spawn } from "child_process";
 import { existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -43,6 +43,28 @@ function runFile(file, args = []) {
   });
 }
 
+function runNodeScriptDetached(scriptName, args = []) {
+  const scriptPath = getScriptPath(scriptName);
+
+  if (!existsSync(scriptPath)) {
+    throw new Error(`No existe el script requerido: ${scriptPath}`);
+  }
+
+  const child = spawn(process.execPath, [scriptPath, ...args], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+
+  child.unref();
+
+  return {
+    pid: child.pid,
+    scriptPath,
+    args
+  };
+}
+
 function normalizeAppName(app) {
   return (app || "").toLowerCase().trim();
 }
@@ -57,7 +79,6 @@ function normalizeMessage(message) {
 
 function siteToUrl(site) {
   const value = (site || "").trim();
-
   const valueLower = value.toLowerCase();
 
   if (valueLower.includes("youtube")) return "https://www.youtube.com";
@@ -257,7 +278,7 @@ export async function handleCommand(command) {
         throw new Error("Missing panelUrl");
       }
 
-      const result = await runNodeScript("show-centinelas-objective.js", [
+      const launched = runNodeScriptDetached("show-centinelas-objective.js", [
         objectiveName,
         panelUrl
       ]);
@@ -267,8 +288,8 @@ export async function handleCommand(command) {
         ok: true,
         objectiveName,
         panelUrl,
-        stdout: result.stdout,
-        stderr: result.stderr
+        pid: launched.pid,
+        message: `Proceso lanzado en segundo plano para fijar ${objectiveName}`
       };
     }
 
