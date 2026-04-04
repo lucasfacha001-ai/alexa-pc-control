@@ -10,6 +10,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 const devices = new Map();
+const deviceState = new Map();
 
 function now() {
   return new Date().toISOString();
@@ -19,17 +20,28 @@ function log(...args) {
   console.log(`[${now()}]`, ...args);
 }
 
-function alexaResponse(text) {
-  return {
+function alexaResponse(text, shouldEndSession = true) {
+  const response = {
     version: "1.0",
     response: {
       outputSpeech: {
         type: "PlainText",
-        text
+        text: String(text || "")
       },
-      shouldEndSession: true
+      shouldEndSession
     }
   };
+
+  if (!shouldEndSession) {
+    response.response.reprompt = {
+      outputSpeech: {
+        type: "PlainText",
+        text: "Dime qué quieres hacer."
+      }
+    };
+  }
+
+  return response;
 }
 
 function safeJson(value) {
@@ -50,9 +62,29 @@ function normalizeVolumeAction(action) {
   return value;
 }
 
-function sendToPC(command) {
-  const deviceId = process.env.DEFAULT_DEVICE_ID || "pc-casa";
-  const ws = devices.get(deviceId);
+function resolveSlotValue(slot) {
+  if (!slot) return null;
+
+  const resolved =
+    slot?.resolutions?.resolutionsPerAuthority?.[0]?.values?.[0]?.value?.name;
+
+  return resolved || slot?.value || null;
+}
+
+function getDefaultDeviceId() {
+  return process.env.DEFAULT_DEVICE_ID || "pc-casa";
+}
+
+function getDevice(deviceId = getDefaultDeviceId()) {
+  return devices.get(deviceId);
+}
+
+function getDeviceState(deviceId = getDefaultDeviceId()) {
+  return deviceState.get(deviceId) || {};
+}
+
+function sendToPC(command, deviceId = getDefaultDeviceId()) {
+  const ws = getDevice(deviceId);
 
   log("sendToPC", {
     targetDeviceId: deviceId,
@@ -62,18 +94,19 @@ function sendToPC(command) {
   });
 
   if (!ws || ws.readyState !== 1) {
-    log("sendToPC failed: computer not connected", {
-      targetDeviceId: deviceId
-    });
+    log("PC NO CONECTADA");
     return false;
   }
 
   try {
     ws.send(JSON.stringify(command));
-    log("sendToPC success", { targetDeviceId: deviceId, command });
+    log("sendToPC éxito", {
+      targetDeviceId: deviceId,
+      command
+    });
     return true;
   } catch (err) {
-    log("sendToPC error", err.message);
+    log("ERROR enviando a PC:", err.message);
     return false;
   }
 }
@@ -82,104 +115,101 @@ wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
   const deviceId = url.searchParams.get("deviceId");
   const token = url.searchParams.get("token");
-  const expectedToken = process.env.AGENT_TOKEN;
 
-  log("WS connection attempt", {
+  log("Intento conexión WS", {
     path: req.url,
     deviceId,
     tokenReceived: token,
-    expectedToken,
-    remoteAddress: req.socket?.remoteAddress || null
+    hasExpectedToken: !!process.env.AGENT_TOKEN
   });
 
   if (!deviceId) {
-    log("WS rejected: missing deviceId");
     ws.close(1008, "missing deviceId");
     return;
   }
 
-  if (!expectedToken) {
-    log("WS rejected: server AGENT_TOKEN missing");
-    ws.close(1011, "server token missing");
-    return;
-  }
-
-  if (token !== expectedToken) {
-    log("WS rejected: invalid token", {
-      deviceId,
-      tokenReceived: token,
-      expectedToken
-    });
+  if (token !== process.env.AGENT_TOKEN) {
     ws.close(1008, "invalid token");
     return;
   }
 
   ws.isAlive = true;
   devices.set(deviceId, ws);
-
-  log("PC connected", {
-    deviceId,
-    totalConnectedDevices: devices.size
+  deviceState.set(deviceId, {
+    lastSeen: now(),
+    lastMessage: null
   });
+
+  log("PC conectada:", deviceId);
 
   ws.on("pong", () => {
     ws.isAlive = true;
-    log("WS pong received", { deviceId });
+    const current = getDeviceState(deviceId);
+    deviceState.set(deviceId, {
+      ...current,
+      lastSeen: now()
+    });
   });
 
   ws.on("message", (data) => {
-    log("WS message from PC", {
-      deviceId,
-      data: data.toString()
+    const raw = data.toString();
+    log("Mensaje desde PC:", raw);
+
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = { type: "raw_message", raw };
+    }
+
+    const current = getDeviceState(deviceId);
+    deviceState.set(deviceId, {
+      ...current,
+      lastSeen: now(),
+      lastMessage: parsed
     });
   });
 
-  ws.on("close", (code, reason) => {
+  ws.on("close", () => {
     devices.delete(deviceId);
-    log("PC disconnected", {
-      deviceId,
-      code,
-      reason: reason.toString(),
-      totalConnectedDevices: devices.size
-    });
+    log("PC desconectada:", deviceId);
   });
 
   ws.on("error", (err) => {
-    log("WS error", {
-      deviceId,
-      message: err.message
-    });
+    log("WS error:", err.message);
   });
 });
 
 setInterval(() => {
   for (const [id, ws] of devices.entries()) {
     if (ws.isAlive === false) {
-      log("WS stale connection terminated", { deviceId: id });
+      log("WS terminado por inactividad:", id);
       ws.terminate();
       devices.delete(id);
       continue;
     }
 
     ws.isAlive = false;
-    log("WS ping sent", { deviceId: id });
-    ws.ping();
+    try {
+      ws.ping();
+      log("WS ping enviado", { deviceId: id });
+    } catch (err) {
+      log("Error enviando ping", { deviceId: id, message: err.message });
+    }
   }
 }, 30000);
 
 app.get("/", (_req, res) => {
-  log("GET /");
   res.send("SERVER OK");
 });
 
 app.get("/alexa", (_req, res) => {
-  log("GET /alexa");
   res.send("ALEXA ENDPOINT OK");
 });
 
 app.post("/alexa", (req, res) => {
   try {
-    log("POST /alexa received");
+    log("POST /alexa");
     log("Headers:", safeJson(req.headers));
     log("Body:", safeJson(req.body));
 
@@ -193,69 +223,55 @@ app.post("/alexa", (req, res) => {
     });
 
     if (!body || !body.request) {
-      log("Invalid Alexa request: missing body.request");
-      return res.json(alexaResponse("Solicitud invalida"));
+      return res.json(alexaResponse("Solicitud inválida"));
     }
 
     if (requestType === "LaunchRequest") {
-      log("Handling LaunchRequest");
       return res.json(
-        alexaResponse("Lista para controlar tu computadora.")
+        alexaResponse(
+          "Mi computadora lista. Dime qué quieres hacer.",
+          false
+        )
       );
     }
 
-    if (intent === "AbrirAplicacionIntent") {
-      const appName = body.request.intent.slots?.app?.value || null;
-      const monitor = body.request.intent.slots?.monitor?.value || null;
+    if (requestType !== "IntentRequest") {
+      return res.json(alexaResponse("No entendí la solicitud."));
+    }
 
-      log("Handling AbrirAplicacionIntent", {
-        appName,
-        monitor
-      });
+    if (intent === "AbrirAplicacionIntent") {
+      const app = resolveSlotValue(body.request.intent.slots?.app);
 
       const ok = sendToPC({
         type: "open_app",
-        app: appName,
-        monitor
+        app
       });
 
       return res.json(
         alexaResponse(
-          ok ? `Abriendo ${appName}` : "La computadora no esta conectada"
+          ok ? `Abriendo ${app}` : "La computadora no está conectada"
         )
       );
     }
 
     if (intent === "AbrirSitioIntent") {
-      const site = body.request.intent.slots?.site?.value || null;
-      const monitor = body.request.intent.slots?.monitor?.value || null;
-
-      log("Handling AbrirSitioIntent", {
-        site,
-        monitor
-      });
+      const site = resolveSlotValue(body.request.intent.slots?.site);
 
       const ok = sendToPC({
         type: "open_website",
-        site,
-        monitor
+        site
       });
 
       return res.json(
         alexaResponse(
-          ok ? `Abriendo ${site}` : "La computadora no esta conectada"
+          ok ? `Abriendo ${site}` : "La computadora no está conectada"
         )
       );
     }
 
     if (intent === "VolumenIntent") {
-      const actionRaw = body.request.intent.slots?.action?.value || null;
-      const action = normalizeVolumeAction(actionRaw);
-
-      log("Handling VolumenIntent", {
-        actionRaw,
-        action
-      });
+      const rawAction = resolveSlotValue(body.request.intent.slots?.action);
+      const action = normalizeVolumeAction(rawAction);
 
       const ok = sendToPC({
         type: "volume",
@@ -264,70 +280,184 @@ app.post("/alexa", (req, res) => {
 
       return res.json(
         alexaResponse(
-          ok ? `Volumen ${actionRaw}` : "La computadora no esta conectada"
+          ok ? `Volumen ${rawAction}` : "La computadora no está conectada"
         )
       );
     }
 
     if (intent === "BloquearComputadoraIntent") {
-      log("Handling BloquearComputadoraIntent");
-
       const ok = sendToPC({
         type: "lock_pc"
       });
 
       return res.json(
         alexaResponse(
-          ok ? "Bloqueando la computadora" : "La computadora no esta conectada"
+          ok ? "Bloqueando la computadora" : "La computadora no está conectada"
         )
       );
     }
 
     if (intent === "SuspenderComputadoraIntent") {
-      log("Handling SuspenderComputadoraIntent");
-
       const ok = sendToPC({
         type: "sleep_pc"
       });
 
       return res.json(
         alexaResponse(
-          ok ? "Suspendiendo la computadora" : "La computadora no esta conectada"
+          ok ? "Suspendiendo la computadora" : "La computadora no está conectada"
         )
       );
     }
 
     if (intent === "ApagarComputadoraIntent") {
-      log("Handling ApagarComputadoraIntent");
-
       const ok = sendToPC({
         type: "shutdown_pc"
       });
 
       return res.json(
         alexaResponse(
-          ok ? "Apagando la computadora" : "La computadora no esta conectada"
+          ok ? "Apagando la computadora" : "La computadora no está conectada"
         )
       );
     }
 
-    log("Unhandled intent", { intent });
-    return res.json(alexaResponse("No entendi ese comando"));
+    // =========================
+    // WHATSAPP
+    // =========================
+
+    if (intent === "AbrirWhatsAppIntent") {
+      const ok = sendToPC({
+        type: "open_whatsapp"
+      });
+
+      return res.json(
+        alexaResponse(
+          ok ? "Abriendo WhatsApp" : "La computadora no está conectada"
+        )
+      );
+    }
+
+    if (intent === "EnviarWhatsAppIntent") {
+      const contact = resolveSlotValue(body.request.intent.slots?.contact);
+      const message = resolveSlotValue(body.request.intent.slots?.message);
+
+      if (!contact || !message) {
+        return res.json(
+          alexaResponse("Necesito el contacto y el mensaje.")
+        );
+      }
+
+      const ok = sendToPC({
+        type: "send_whatsapp_message",
+        contact,
+        message
+      });
+
+      return res.json(
+        alexaResponse(
+          ok
+            ? `Enviando WhatsApp a ${contact}`
+            : "La computadora no está conectada"
+        )
+      );
+    }
+
+    if (intent === "ResponderWhatsAppIntent") {
+      const contact = resolveSlotValue(body.request.intent.slots?.contact);
+      const message = resolveSlotValue(body.request.intent.slots?.message);
+
+      if (!contact || !message) {
+        return res.json(
+          alexaResponse("Necesito a quién responder y el mensaje.")
+        );
+      }
+
+      const ok = sendToPC({
+        type: "reply_whatsapp_message",
+        contact,
+        message
+      });
+
+      return res.json(
+        alexaResponse(
+          ok
+            ? `Respondiendo a ${contact}`
+            : "La computadora no está conectada"
+        )
+      );
+    }
+
+    if (intent === "MensajesWhatsAppNuevosIntent") {
+      const ok = sendToPC({
+        type: "read_unread_whatsapp"
+      });
+
+      if (!ok) {
+        return res.json(alexaResponse("La computadora no está conectada"));
+      }
+
+      const state = getDeviceState();
+      const lastMessage = state?.lastMessage;
+
+      if (
+        lastMessage &&
+        lastMessage.type === "whatsapp_unread_result" &&
+        typeof lastMessage.summary === "string"
+      ) {
+        return res.json(alexaResponse(lastMessage.summary));
+      }
+
+      return res.json(
+        alexaResponse(
+          "Voy a revisar los mensajes nuevos de WhatsApp en la computadora."
+        )
+      );
+    }
+
+    if (intent === "LeerUltimoWhatsAppIntent") {
+      const contact = resolveSlotValue(body.request.intent.slots?.contact);
+
+      if (!contact) {
+        return res.json(alexaResponse("Necesito el nombre del contacto."));
+      }
+
+      const ok = sendToPC({
+        type: "read_latest_whatsapp",
+        contact
+      });
+
+      if (!ok) {
+        return res.json(alexaResponse("La computadora no está conectada"));
+      }
+
+      const state = getDeviceState();
+      const lastMessage = state?.lastMessage;
+
+      if (
+        lastMessage &&
+        lastMessage.type === "whatsapp_latest_result" &&
+        typeof lastMessage.text === "string"
+      ) {
+        return res.json(
+          alexaResponse(`El último mensaje de ${contact} dice: ${lastMessage.text}`)
+        );
+      }
+
+      return res.json(
+        alexaResponse(`Voy a revisar el último mensaje de ${contact}.`)
+      );
+    }
+
+    return res.json(alexaResponse("No entendí ese comando."));
   } catch (e) {
-    log("POST /alexa error", {
-      message: e.message,
-      stack: e.stack
-    });
-    return res.json(alexaResponse("Ocurrio un error"));
+    log("ERROR:", e.message);
+    log("STACK:", e.stack);
+    return res.json(alexaResponse("Error en el servidor"));
   }
 });
 
 const PORT = process.env.PORT || 10000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  log("Server running", {
-    port: PORT,
-    defaultDeviceId: process.env.DEFAULT_DEVICE_ID || "pc-casa",
-    hasAgentToken: !!process.env.AGENT_TOKEN
-  });
+  log("Servidor corriendo en puerto", PORT);
 });
