@@ -12,6 +12,13 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 const devices = new Map();
 const deviceState = new Map();
 
+const CENTINELAS_BASE_URL =
+  process.env.CENTINELAS_BASE_URL || "https://centinela-security-zttw.onrender.com";
+
+const CENTINELAS_PANEL_URL =
+  process.env.CENTINELAS_PANEL_URL ||
+  "https://centinela-security-zttw.onrender.com/panel-admin/index.html";
+
 function now() {
   return new Date().toISOString();
 }
@@ -62,6 +69,14 @@ function normalizeVolumeAction(action) {
   return value;
 }
 
+function normalizeText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
+
 function resolveSlotValue(slot) {
   if (!slot) return null;
 
@@ -109,6 +124,54 @@ function sendToPC(command, deviceId = getDefaultDeviceId()) {
     log("ERROR enviando a PC:", err.message);
     return false;
   }
+}
+
+async function fetchCentinelasObjectives() {
+  const url = `${CENTINELAS_BASE_URL}/api/objetivos`;
+
+  log("Consultando objetivos Centinelas", { url });
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Centinelas respondió ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  if (!Array.isArray(data)) {
+    throw new Error("La respuesta de /api/objetivos no es una lista");
+  }
+
+  return data;
+}
+
+async function findCentinelasObjective(query) {
+  const q = normalizeText(query);
+
+  if (!q) return null;
+
+  const objectives = await fetchCentinelasObjectives();
+
+  let exact = objectives.find((o) => normalizeText(o?.nombre) === q);
+  if (exact) return exact;
+
+  let startsWith = objectives.find((o) =>
+    normalizeText(o?.nombre).startsWith(q)
+  );
+  if (startsWith) return startsWith;
+
+  let partial = objectives.find((o) =>
+    normalizeText(o?.nombre).includes(q)
+  );
+  if (partial) return partial;
+
+  return null;
 }
 
 wss.on("connection", (ws, req) => {
@@ -207,7 +270,18 @@ app.get("/alexa", (_req, res) => {
   res.send("ALEXA ENDPOINT OK");
 });
 
-app.post("/alexa", (req, res) => {
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    serverTime: now(),
+    connectedDevices: Array.from(devices.keys()),
+    defaultDeviceId: getDefaultDeviceId(),
+    centinelasBaseUrl: CENTINELAS_BASE_URL,
+    centinelasPanelUrl: CENTINELAS_PANEL_URL
+  });
+});
+
+app.post("/alexa", async (req, res) => {
   try {
     log("POST /alexa");
     log("Headers:", safeJson(req.headers));
@@ -319,6 +393,51 @@ app.post("/alexa", (req, res) => {
           ok ? "Apagando la computadora" : "La computadora no está conectada"
         )
       );
+    }
+
+    if (intent === "MostrarObjetivoCentinelasIntent") {
+      const objetivo = resolveSlotValue(body.request.intent.slots?.objetivo);
+
+      if (!objetivo) {
+        return res.json(
+          alexaResponse("Necesito el nombre del objetivo que quieres ver.")
+        );
+      }
+
+      const ws = getDevice();
+      if (!ws || ws.readyState !== 1) {
+        return res.json(alexaResponse("La computadora no está conectada"));
+      }
+
+      try {
+        const foundObjective = await findCentinelasObjective(objetivo);
+
+        if (!foundObjective) {
+          return res.json(
+            alexaResponse(`No encontré el objetivo ${objetivo} en Centinelas.`)
+          );
+        }
+
+        const ok = sendToPC({
+          type: "show_centinelas_objective",
+          objectiveName: foundObjective.nombre,
+          objectiveId: foundObjective.id || null,
+          panelUrl: CENTINELAS_PANEL_URL
+        });
+
+        return res.json(
+          alexaResponse(
+            ok
+              ? `Mostrando ${foundObjective.nombre} en Centinelas`
+              : "La computadora no está conectada"
+          )
+        );
+      } catch (err) {
+        log("Error buscando objetivo en Centinelas:", err.message);
+        return res.json(
+          alexaResponse("Tuve un problema al consultar Centinelas.")
+        );
+      }
     }
 
     // =========================
