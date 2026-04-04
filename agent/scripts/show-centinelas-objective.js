@@ -77,30 +77,29 @@ async function clickObjectiveByText(page, objectiveName) {
   return false;
 }
 
-async function getPage(browser, panelUrl) {
+async function getCentinelasPage(browser, panelUrl) {
   const contexts = browser.contexts();
-  let context = contexts[0];
-
-  if (!context) {
-    throw new Error("No encontré un contexto abierto en Chrome.");
+  if (!contexts.length) {
+    throw new Error("No encontré Chrome abierto con depuración remota en el puerto 9222.");
   }
 
-  let pages = context.pages();
-  let page =
-    pages.find((p) => (p.url() || "").includes("centinela-security-zttw.onrender.com")) ||
-    pages[0];
+  const context = contexts[0];
+  const pages = context.pages();
 
-  if (!page) {
-    page = await context.newPage();
+  // Reusar una pestaña ya abierta de Centinelas
+  for (const page of pages) {
+    const url = page.url() || "";
+    if (url.includes("centinela-security-zttw.onrender.com")) {
+      return page;
+    }
   }
 
-  if (!page.url() || page.url() === "about:blank") {
-    await page.goto(panelUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
-    });
-  }
-
+  // Si no existe, crear una nueva
+  const page = await context.newPage();
+  await page.goto(panelUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
   return page;
 }
 
@@ -113,7 +112,9 @@ async function main() {
   }
 
   const browser = await chromium.connectOverCDP("http://127.0.0.1:9222");
-  const page = await getPage(browser, panelUrl);
+  const page = await getCentinelasPage(browser, panelUrl);
+
+  await page.bringToFront();
 
   if (!page.url().includes("centinela-security-zttw.onrender.com")) {
     await page.goto(panelUrl, {
@@ -122,7 +123,6 @@ async function main() {
     });
   }
 
-  await page.bringToFront();
   await sleep(5000);
 
   await safeClick(page, [
@@ -154,7 +154,7 @@ async function main() {
 
 main().catch((err) => {
   console.error(
-    `Error: ${err.message}. Asegúrate de abrir Chrome con --remote-debugging-port=9222 y tu Profile 2.`
+    `Error: ${err.message}. Asegúrate de que el Chrome dedicado esté abierto con --remote-debugging-port=9222.`
   );
   process.exit(1);
 });
