@@ -94,6 +94,11 @@ async function selectObjectiveInDropdown(page, objectiveName) {
   const target = normalizeText(objectiveName);
   const select = await openObjectiveFilter(page);
 
+  await page.waitForFunction(() => {
+    const el = document.querySelector("#filtro-objetivo-mapa");
+    return el && el.options && el.options.length > 1;
+  }, { timeout: 15000 });
+
   const options = await select.locator("option").evaluateAll((nodes) =>
     nodes.map((n) => ({
       value: n.value,
@@ -124,8 +129,10 @@ async function selectObjectiveInDropdown(page, objectiveName) {
     throw new Error(`No encontré el objetivo en el selector: ${objectiveName}`);
   }
 
+  console.log("Seleccionando objetivo:", best.text);
+
   await select.selectOption(best.value);
-  await sleep(1500);
+  await sleep(2000);
 
   return best;
 }
