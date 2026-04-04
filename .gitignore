@@ -1,0 +1,7 @@
+node_modules/
+agent/node_modules/
+server/node_modules/
+.env
+.env.*
+playwright-report/
+test-results/
