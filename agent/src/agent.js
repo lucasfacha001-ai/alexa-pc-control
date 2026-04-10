@@ -36,6 +36,36 @@ function sendJson(ws, payload) {
   }
 }
 
+function withRequestId(payload, cmd) {
+  if (!payload || typeof payload !== "object") return payload;
+  if (cmd?.requestId && !payload.requestId) {
+    return {
+      ...payload,
+      requestId: cmd.requestId
+    };
+  }
+  return payload;
+}
+
+function buildCapabilities() {
+  return [
+    "open_app",
+    "open_website",
+    "volume",
+    "lock_pc",
+    "sleep_pc",
+    "shutdown_pc",
+    "open_whatsapp",
+    "send_whatsapp_message",
+    "reply_whatsapp_message",
+    "read_unread_whatsapp",
+    "read_latest_whatsapp",
+    "show_centinelas_objective",
+    "show_centinelas_guard",
+    "get_centinelas_present_guards"
+  ];
+}
+
 function connect() {
   const wsUrl = buildWsUrl();
 
@@ -51,20 +81,7 @@ function connect() {
       type: "agent_hello",
       deviceId: DEVICE,
       timestamp: new Date().toISOString(),
-      capabilities: [
-        "open_app",
-        "open_website",
-        "volume",
-        "lock_pc",
-        "sleep_pc",
-        "shutdown_pc",
-        "open_whatsapp",
-        "send_whatsapp_message",
-        "reply_whatsapp_message",
-        "read_unread_whatsapp",
-        "read_latest_whatsapp",
-        "show_centinelas_objective"
-      ]
+      capabilities: buildCapabilities()
     });
   });
 
@@ -86,7 +103,9 @@ function connect() {
     }
 
     try {
-      const result = await handleCommand(cmd);
+      const rawResult = await handleCommand(cmd);
+      const result = withRequestId(rawResult, cmd);
+
       log("Command executed:", result);
 
       sendJson(ws, {
@@ -94,16 +113,16 @@ function connect() {
         deviceId: DEVICE,
         commandType: cmd.type,
         ok: true,
+        requestId: cmd?.requestId || null,
         result,
         timestamp: new Date().toISOString()
       });
 
-      // Si el resultado ya trae un tipo útil (por ejemplo whatsapp_unread_result),
-      // también lo reenviamos tal cual para que el server pueda usarlo directamente.
       if (result && typeof result === "object" && result.type) {
         sendJson(ws, {
           ...result,
           deviceId: DEVICE,
+          requestId: result.requestId || cmd?.requestId || null,
           timestamp: new Date().toISOString()
         });
       }
@@ -115,6 +134,7 @@ function connect() {
         deviceId: DEVICE,
         commandType: cmd.type,
         ok: false,
+        requestId: cmd?.requestId || null,
         error: err.message,
         timestamp: new Date().toISOString()
       });

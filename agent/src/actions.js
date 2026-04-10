@@ -77,6 +77,14 @@ function normalizeMessage(message) {
   return (message || "").trim();
 }
 
+function normalizeObjectiveName(value) {
+  return normalizeMessage(value);
+}
+
+function normalizeGuardName(value) {
+  return normalizeMessage(value);
+}
+
 function siteToUrl(site) {
   const value = (site || "").trim();
   const valueLower = value.toLowerCase();
@@ -198,6 +206,31 @@ function parseJsonStdout(stdout, fallbackType) {
   }
 }
 
+function launchCentinelasScript(scriptName, payload = {}) {
+  const panelUrl = normalizeMessage(payload.panelUrl);
+  const objectiveName = normalizeObjectiveName(payload.objectiveName);
+  const guardName = normalizeGuardName(payload.guardName);
+
+  if (!panelUrl) {
+    throw new Error("Missing panelUrl");
+  }
+
+  if (scriptName === "show-centinelas-objective.js" && !objectiveName) {
+    throw new Error("Missing objectiveName");
+  }
+
+  if (scriptName === "show-centinelas-guard.js" && !guardName) {
+    throw new Error("Missing guardName");
+  }
+
+  const args = [];
+  if (scriptName === "show-centinelas-objective.js") args.push(objectiveName);
+  if (scriptName === "show-centinelas-guard.js") args.push(guardName);
+  args.push(panelUrl);
+
+  return runNodeScriptDetached(scriptName, args);
+}
+
 export async function handleCommand(command) {
   switch (command.type) {
     case "open_app": {
@@ -267,7 +300,7 @@ export async function handleCommand(command) {
     }
 
     case "show_centinelas_objective": {
-      const objectiveName = normalizeMessage(command.objectiveName);
+      const objectiveName = normalizeObjectiveName(command.objectiveName);
       const panelUrl = normalizeMessage(command.panelUrl);
 
       if (!objectiveName) {
@@ -278,10 +311,10 @@ export async function handleCommand(command) {
         throw new Error("Missing panelUrl");
       }
 
-      const launched = runNodeScriptDetached("show-centinelas-objective.js", [
+      const launched = launchCentinelasScript("show-centinelas-objective.js", {
         objectiveName,
         panelUrl
-      ]);
+      });
 
       return {
         type: "show_centinelas_objective_result",
@@ -289,7 +322,55 @@ export async function handleCommand(command) {
         objectiveName,
         panelUrl,
         pid: launched.pid,
+        scriptPath: launched.scriptPath,
         message: `Proceso lanzado en segundo plano para fijar ${objectiveName}`
+      };
+    }
+
+    case "show_centinelas_guard": {
+      const guardName = normalizeGuardName(command.guardName);
+      const panelUrl = normalizeMessage(command.panelUrl);
+
+      if (!guardName) {
+        throw new Error("Missing guardName");
+      }
+
+      if (!panelUrl) {
+        throw new Error("Missing panelUrl");
+      }
+
+      const launched = launchCentinelasScript("show-centinelas-guard.js", {
+        guardName,
+        panelUrl
+      });
+
+      return {
+        type: "show_centinelas_guard_result",
+        ok: true,
+        guardName,
+        panelUrl,
+        pid: launched.pid,
+        scriptPath: launched.scriptPath,
+        message: `Proceso lanzado en segundo plano para fijar ${guardName}`
+      };
+    }
+
+    case "get_centinelas_present_guards": {
+      const panelUrl = normalizeMessage(command.panelUrl);
+
+      if (!panelUrl) {
+        throw new Error("Missing panelUrl");
+      }
+
+      const result = await runNodeScript("get-centinelas-present-guards.js", [panelUrl]);
+
+      return {
+        type: "centinelas_present_guards_result",
+        ok: true,
+        panelUrl,
+        parsed: parseJsonStdout(result.stdout, "centinelas_present_guards_result"),
+        stdout: result.stdout,
+        stderr: result.stderr
       };
     }
 

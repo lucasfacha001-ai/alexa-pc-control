@@ -74,6 +74,7 @@ function normalizeText(value) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -96,6 +97,15 @@ function getDevice(deviceId = getDefaultDeviceId()) {
 
 function getDeviceState(deviceId = getDefaultDeviceId()) {
   return deviceState.get(deviceId) || {};
+}
+
+function setDeviceLastMessage(deviceId, parsed) {
+  const current = getDeviceState(deviceId);
+  deviceState.set(deviceId, {
+    ...current,
+    lastSeen: now(),
+    lastMessage: parsed
+  });
 }
 
 function sendToPC(command, deviceId = getDefaultDeviceId()) {
@@ -126,10 +136,10 @@ function sendToPC(command, deviceId = getDefaultDeviceId()) {
   }
 }
 
-async function fetchCentinelasObjectives() {
-  const url = `${CENTINELAS_BASE_URL}/api/objetivos`;
+async function fetchCentinelasJson(pathname) {
+  const url = `${CENTINELAS_BASE_URL}${pathname}`;
 
-  log("Consultando objetivos Centinelas", { url });
+  log("Consultando Centinelas", { url });
 
   const response = await fetch(url, {
     method: "GET",
@@ -139,13 +149,27 @@ async function fetchCentinelasObjectives() {
   });
 
   if (!response.ok) {
-    throw new Error(`Centinelas respondió ${response.status}`);
+    throw new Error(`Centinelas respondió ${response.status} en ${pathname}`);
   }
 
-  const data = await response.json();
+  return await response.json();
+}
+
+async function fetchCentinelasObjectives() {
+  const data = await fetchCentinelasJson("/api/objetivos");
 
   if (!Array.isArray(data)) {
     throw new Error("La respuesta de /api/objetivos no es una lista");
+  }
+
+  return data;
+}
+
+async function fetchCentinelasDevices() {
+  const data = await fetchCentinelasJson("/api/dispositivos");
+
+  if (!Array.isArray(data)) {
+    throw new Error("La respuesta de /api/dispositivos no es una lista");
   }
 
   return data;
@@ -172,6 +196,67 @@ async function findCentinelasObjective(query) {
   if (partial) return partial;
 
   return null;
+}
+
+async function findCentinelasGuard(query) {
+  const q = normalizeText(query);
+
+  if (!q) return null;
+
+  const devices = await fetchCentinelasDevices();
+
+  const guards = devices.filter((d) => {
+    const tipo = normalizeText(d?.tipo || "guardia");
+    return tipo !== "admin" && tipo !== "dueno" && tipo !== "supervisor";
+  });
+
+  let exact = guards.find((g) => normalizeText(g?.nombre) === q);
+  if (exact) return exact;
+
+  let startsWith = guards.find((g) => normalizeText(g?.nombre).startsWith(q));
+  if (startsWith) return startsWith;
+
+  let partial = guards.find((g) => normalizeText(g?.nombre).includes(q));
+  if (partial) return partial;
+
+  return null;
+}
+
+function createRequestId(prefix = "req") {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function waitForDeviceMessage(predicate, deviceId = getDefaultDeviceId(), timeoutMs = 7000) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+
+    const check = () => {
+      const state = getDeviceState(deviceId);
+      const lastMessage = state?.lastMessage || null;
+
+      if (lastMessage && predicate(lastMessage)) {
+        resolve(lastMessage);
+        return;
+      }
+
+      if (Date.now() - started >= timeoutMs) {
+        resolve(null);
+        return;
+      }
+
+      setTimeout(check, 250);
+    };
+
+    check();
+  });
+}
+
+async function requestPcAndWait(command, matcher, deviceId = getDefaultDeviceId(), timeoutMs = 7000) {
+  const ok = sendToPC(command, deviceId);
+  if (!ok) return { ok: false, message: null };
+
+  const message = await waitForDeviceMessage(matcher, deviceId, timeoutMs);
+  return { ok: true, message };
 }
 
 wss.on("connection", (ws, req) => {
@@ -225,12 +310,7 @@ wss.on("connection", (ws, req) => {
       parsed = { type: "raw_message", raw };
     }
 
-    const current = getDeviceState(deviceId);
-    deviceState.set(deviceId, {
-      ...current,
-      lastSeen: now(),
-      lastMessage: parsed
-    });
+    setDeviceLastMessage(deviceId, parsed);
   });
 
   ws.on("close", () => {
@@ -290,6 +370,7 @@ app.post("/alexa", async (req, res) => {
     const body = req.body;
     const requestType = body?.request?.type;
     const intent = body?.request?.intent?.name;
+    const deviceId = getDefaultDeviceId();
 
     log("Alexa parsed request", {
       requestType,
@@ -319,7 +400,7 @@ app.post("/alexa", async (req, res) => {
       const ok = sendToPC({
         type: "open_app",
         app
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -334,7 +415,7 @@ app.post("/alexa", async (req, res) => {
       const ok = sendToPC({
         type: "open_website",
         site
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -350,7 +431,7 @@ app.post("/alexa", async (req, res) => {
       const ok = sendToPC({
         type: "volume",
         action
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -362,7 +443,7 @@ app.post("/alexa", async (req, res) => {
     if (intent === "BloquearComputadoraIntent") {
       const ok = sendToPC({
         type: "lock_pc"
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -374,7 +455,7 @@ app.post("/alexa", async (req, res) => {
     if (intent === "SuspenderComputadoraIntent") {
       const ok = sendToPC({
         type: "sleep_pc"
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -386,7 +467,7 @@ app.post("/alexa", async (req, res) => {
     if (intent === "ApagarComputadoraIntent") {
       const ok = sendToPC({
         type: "shutdown_pc"
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -404,7 +485,7 @@ app.post("/alexa", async (req, res) => {
         );
       }
 
-      const ws = getDevice();
+      const ws = getDevice(deviceId);
       if (!ws || ws.readyState !== 1) {
         return res.json(alexaResponse("La computadora no está conectada"));
       }
@@ -423,7 +504,7 @@ app.post("/alexa", async (req, res) => {
           objectiveName: foundObjective.nombre,
           objectiveId: foundObjective.id || null,
           panelUrl: CENTINELAS_PANEL_URL
-        });
+        }, deviceId);
 
         return res.json(
           alexaResponse(
@@ -440,6 +521,120 @@ app.post("/alexa", async (req, res) => {
       }
     }
 
+    if (intent === "MostrarGuardiaCentinelasIntent") {
+      const guardia = resolveSlotValue(body.request.intent.slots?.guardia);
+
+      if (!guardia) {
+        return res.json(
+          alexaResponse("Necesito el nombre del guardia que quieres ver.")
+        );
+      }
+
+      const ws = getDevice(deviceId);
+      if (!ws || ws.readyState !== 1) {
+        return res.json(alexaResponse("La computadora no está conectada"));
+      }
+
+      try {
+        const foundGuard = await findCentinelasGuard(guardia);
+
+        if (!foundGuard) {
+          return res.json(
+            alexaResponse(`No encontré al guardia ${guardia} en Centinelas.`)
+          );
+        }
+
+        const ok = sendToPC({
+          type: "show_centinelas_guard",
+          guardName: foundGuard.nombre,
+          guardId: foundGuard.id || null,
+          panelUrl: CENTINELAS_PANEL_URL
+        }, deviceId);
+
+        return res.json(
+          alexaResponse(
+            ok
+              ? `Mostrando al guardia ${foundGuard.nombre} en Centinelas`
+              : "La computadora no está conectada"
+          )
+        );
+      } catch (err) {
+        log("Error buscando guardia en Centinelas:", err.message);
+        return res.json(
+          alexaResponse("Tuve un problema al consultar Centinelas.")
+        );
+      }
+    }
+
+    if (intent === "GuardiasPresentesCentinelasIntent") {
+      const ws = getDevice(deviceId);
+      if (!ws || ws.readyState !== 1) {
+        return res.json(alexaResponse("La computadora no está conectada"));
+      }
+
+      const requestId = createRequestId("present_guards");
+      const result = await requestPcAndWait(
+        {
+          type: "get_centinelas_present_guards",
+          panelUrl: CENTINELAS_PANEL_URL,
+          requestId
+        },
+        (msg) => {
+          if (!msg || typeof msg !== "object") return false;
+          if (msg.requestId && msg.requestId === requestId) return true;
+          if (msg.type === "centinelas_present_guards_result") return true;
+          if (msg.type === "command_result" && msg.commandType === "get_centinelas_present_guards") return true;
+          return false;
+        },
+        deviceId,
+        9000
+      );
+
+      if (!result.ok) {
+        return res.json(alexaResponse("La computadora no está conectada"));
+      }
+
+      const payload =
+        result.message?.parsed ||
+        result.message?.result ||
+        result.message ||
+        null;
+
+      const guards =
+        payload?.guards ||
+        payload?.presentGuards ||
+        payload?.items ||
+        payload?.data ||
+        null;
+
+      if (Array.isArray(guards)) {
+        if (guards.length === 0) {
+          return res.json(alexaResponse("No hay guardias presentes en este momento."));
+        }
+
+        const names = guards
+          .map((g) => String(g?.nombre || g?.name || "").trim())
+          .filter(Boolean)
+          .slice(0, 5);
+
+        const more = guards.length > names.length ? ` y ${guards.length - names.length} más` : "";
+        const spoken =
+          names.length > 0
+            ? `Hay ${guards.length} guardias presentes. ${names.join(", ")}${more}.`
+            : `Hay ${guards.length} guardias presentes.`;
+
+        return res.json(alexaResponse(spoken));
+      }
+
+      if (typeof payload?.summary === "string" && payload.summary.trim()) {
+        return res.json(alexaResponse(payload.summary));
+      }
+
+      return res.json(
+        alexaResponse("No pude obtener el listado de guardias presentes.")
+      );
+    }
+
     // =========================
     // WHATSAPP
     // =========================
@@ -447,7 +642,7 @@ app.post("/alexa", async (req, res) => {
     if (intent === "AbrirWhatsAppIntent") {
       const ok = sendToPC({
         type: "open_whatsapp"
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -470,7 +665,7 @@ app.post("/alexa", async (req, res) => {
         type: "send_whatsapp_message",
         contact,
         message
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -495,7 +690,7 @@ app.post("/alexa", async (req, res) => {
         type: "reply_whatsapp_message",
         contact,
         message
-      });
+      }, deviceId);
 
       return res.json(
         alexaResponse(
@@ -507,16 +702,28 @@ app.post("/alexa", async (req, res) => {
     }
 
     if (intent === "MensajesWhatsAppNuevosIntent") {
-      const ok = sendToPC({
-        type: "read_unread_whatsapp"
-      });
+      const requestId = createRequestId("wa_unread");
+      const result = await requestPcAndWait(
+        {
+          type: "read_unread_whatsapp",
+          requestId
+        },
+        (msg) => {
+          if (!msg || typeof msg !== "object") return false;
+          if (msg.requestId && msg.requestId === requestId) return true;
+          if (msg.type === "whatsapp_unread_result") return true;
+          if (msg.type === "command_result" && msg.commandType === "read_unread_whatsapp") return true;
+          return false;
+        },
+        deviceId,
+        7000
+      );
 
-      if (!ok) {
+      if (!result.ok) {
         return res.json(alexaResponse("La computadora no está conectada"));
       }
 
-      const state = getDeviceState();
-      const lastMessage = state?.lastMessage;
+      const lastMessage = result.message;
 
       if (
         lastMessage &&
@@ -540,17 +747,29 @@ app.post("/alexa", async (req, res) => {
         return res.json(alexaResponse("Necesito el nombre del contacto."));
       }
 
-      const ok = sendToPC({
-        type: "read_latest_whatsapp",
-        contact
-      });
+      const requestId = createRequestId("wa_latest");
+      const result = await requestPcAndWait(
+        {
+          type: "read_latest_whatsapp",
+          contact,
+          requestId
+        },
+        (msg) => {
+          if (!msg || typeof msg !== "object") return false;
+          if (msg.requestId && msg.requestId === requestId) return true;
+          if (msg.type === "whatsapp_latest_result") return true;
+          if (msg.type === "command_result" && msg.commandType === "read_latest_whatsapp") return true;
+          return false;
+        },
+        deviceId,
+        7000
+      );
 
-      if (!ok) {
+      if (!result.ok) {
         return res.json(alexaResponse("La computadora no está conectada"));
       }
 
-      const state = getDeviceState();
-      const lastMessage = state?.lastMessage;
+      const lastMessage = result.message;
 
       if (
         lastMessage &&

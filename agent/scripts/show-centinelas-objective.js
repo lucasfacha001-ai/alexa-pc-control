@@ -60,7 +60,7 @@ function killPreviousProcess(pid) {
     if (process.platform === "win32") {
       execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
         stdio: "ignore",
-        windowsHide: true
+        windowsHide: true,
       });
     } else {
       process.kill(pid, "SIGTERM");
@@ -86,7 +86,7 @@ async function acquireSingleInstanceLock(objectiveName) {
   writeLockFile({
     pid: process.pid,
     objectiveName,
-    startedAt: new Date().toISOString()
+    startedAt: new Date().toISOString(),
   });
   lockOwned = true;
 }
@@ -153,7 +153,7 @@ async function getCentinelasPage(browser, panelUrl) {
   const page = await context.newPage();
   await page.goto(panelUrl, {
     waitUntil: "domcontentloaded",
-    timeout: 60000
+    timeout: 60000,
   });
   return page;
 }
@@ -164,12 +164,12 @@ async function resetPanel(page, panelUrl) {
   try {
     await page.goto(panelUrl, {
       waitUntil: "domcontentloaded",
-      timeout: 60000
+      timeout: 60000,
     });
   } catch {
     await page.reload({
       waitUntil: "domcontentloaded",
-      timeout: 60000
+      timeout: 60000,
     });
   }
 
@@ -179,7 +179,7 @@ async function resetPanel(page, panelUrl) {
     'button:has-text("Cerrar")',
     'button:has-text("Aceptar")',
     'button:has-text("Entendido")',
-    'button:has-text("OK")'
+    'button:has-text("OK")',
   ]);
 }
 
@@ -219,110 +219,143 @@ async function disableAutoCenterAndClearGuard(page) {
   await sleep(800);
 }
 
-async function openObjectiveFilter(page) {
-  const select = page.locator("#filtro-objetivo-mapa").first();
-  await select.waitFor({ timeout: 15000 });
-  return select;
-}
-
-async function selectObjectiveInDropdown(page, objectiveName) {
-  const target = normalizeText(objectiveName);
-  const select = await openObjectiveFilter(page);
-
+async function waitForAutomationReady(page) {
   await page.waitForFunction(() => {
-    const el = document.querySelector("#filtro-objetivo-mapa");
-    return el && el.options && el.options.length > 1;
-  }, { timeout: 15000 });
+    const mapReady = !!window.map && typeof window.map.setView === "function";
+    const centinelasReady =
+      !!window.CentinelasAutomation &&
+      typeof window.CentinelasAutomation.isReady === "function" &&
+      typeof window.CentinelasAutomation.showObjectiveByName === "function";
 
-  const options = await select.locator("option").evaluateAll((nodes) =>
-    nodes.map((n) => ({
-      value: n.value,
-      text: (n.textContent || "").trim()
-    }))
-  );
+    const mapAutomationReady =
+      !!window.CentinelasMapAutomation &&
+      typeof window.CentinelasMapAutomation.focusObjectiveByName === "function";
 
-  let best = null;
-  let bestScore = -1;
+    const objectivesReady = Array.isArray(window.objetivos);
 
-  for (const opt of options) {
-    const txt = normalizeText(opt.text);
-    if (!txt || !opt.value) continue;
-
-    let score = -1;
-    if (txt === target) score = 100;
-    else if (txt.startsWith(target)) score = 80;
-    else if (txt.includes(target)) score = 60;
-    else if (target.includes(txt) && txt.length > 3) score = 40;
-
-    if (score > bestScore) {
-      bestScore = score;
-      best = opt;
-    }
-  }
-
-  if (!best) {
-    throw new Error(`No encontré el objetivo en el selector: ${objectiveName}`);
-  }
-
-  console.log("Seleccionando objetivo:", best.text);
-
-  await select.selectOption(best.value);
-  await sleep(1500);
-
-  return best;
+    return mapReady && objectivesReady && (centinelasReady || mapAutomationReady);
+  }, { timeout: 30000 });
 }
 
-async function centerSelectedObjective(page) {
-  await page.evaluate(() => {
+async function focusObjectiveWithStableApi(page, objectiveName) {
+  const result = await page.evaluate(async (name) => {
+    const response = {
+      ok: false,
+      source: null,
+      detail: null,
+      error: null,
+    };
+
     try {
-      const filtroObjMapa = document.getElementById("filtro-objetivo-mapa");
-      const id = filtroObjMapa?.value || "";
-      if (!id) return;
+      if (
+        window.CentinelasAutomation &&
+        typeof window.CentinelasAutomation.waitUntilReady === "function"
+      ) {
+        try {
+          await window.CentinelasAutomation.waitUntilReady(12000);
+        } catch {}
+      }
 
-      const obj =
-        typeof window.findObjetivo === "function"
-          ? window.findObjetivo(id)
-          : (window.objetivos || []).find((o) => String(o?.id) === String(id));
+      if (
+        window.CentinelasAutomation &&
+        typeof window.CentinelasAutomation.showObjectiveByName === "function"
+      ) {
+        const r = await window.CentinelasAutomation.showObjectiveByName(name);
+        response.ok = !!r?.ok;
+        response.source = "CentinelasAutomation.showObjectiveByName";
+        response.detail = r || null;
+        return response;
+      }
 
-      if (!obj || obj.lat == null || obj.lng == null || !window.map) return;
-
-      try {
-        window.autoCenter = false;
-      } catch {}
-
-      try {
-        window.guardiaSeleccionadoId = null;
-      } catch {}
-
-      try {
-        const chkAuto = document.getElementById("chk-auto-center");
-        if (chkAuto) chkAuto.checked = false;
-      } catch {}
-
-      try {
-        const chkAutoSmart = document.getElementById("chk-auto-smart");
-        if (chkAutoSmart) chkAutoSmart.checked = false;
-      } catch {}
-
-      if (typeof window.map.flyTo === "function") {
-        window.map.flyTo([obj.lat, obj.lng], 17, {
-          animate: true,
-          duration: 0.8
+      if (
+        window.CentinelasMapAutomation &&
+        typeof window.CentinelasMapAutomation.focusObjectiveByName === "function"
+      ) {
+        const r = await window.CentinelasMapAutomation.focusObjectiveByName(name, {
+          zoom: 16,
+          source: "agent_show_centinelas_objective",
         });
-      } else if (typeof window.map.setView === "function") {
-        window.map.setView([obj.lat, obj.lng], 17);
+        response.ok = !!r?.ok;
+        response.source = "CentinelasMapAutomation.focusObjectiveByName";
+        response.detail = r || null;
+        return response;
       }
 
-      if (typeof window.renderObjetivosAdmin === "function") {
-        window.renderObjetivosAdmin();
-      }
-      if (typeof window.renderDispositivosAdmin === "function") {
-        window.renderDispositivosAdmin();
-      }
-    } catch {}
-  });
+      throw new Error("No existe API estable de automatización para objetivos.");
+    } catch (err) {
+      response.error = err?.message || String(err);
+      return response;
+    }
+  }, objectiveName);
 
-  await sleep(1200);
+  if (!result?.ok) {
+    throw new Error(result?.error || "No se pudo enfocar el objetivo con la API estable");
+  }
+
+  return result;
+}
+
+async function resolveObjectiveValueForLock(page, objectiveName) {
+  const result = await page.evaluate((name) => {
+    const normalize = (value) => {
+      try {
+        return String(value || "")
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      } catch {
+        return String(value || "").toLowerCase().trim();
+      }
+    };
+
+    const target = normalize(name);
+    const select = document.getElementById("filtro-objetivo-mapa");
+    if (!select || !select.options) {
+      return { ok: false, error: "No existe #filtro-objetivo-mapa" };
+    }
+
+    const options = Array.from(select.options || []).map((opt) => ({
+      value: String(opt.value || "").trim(),
+      text: String(opt.textContent || "").trim(),
+    }));
+
+    let best = null;
+    let bestScore = -1;
+
+    for (const opt of options) {
+      const txt = normalize(opt.text);
+      if (!txt || !opt.value) continue;
+
+      let score = -1;
+      if (txt === target) score = 100;
+      else if (txt.startsWith(target)) score = 80;
+      else if (txt.includes(target)) score = 60;
+      else if (target.includes(txt) && txt.length > 3) score = 40;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = opt;
+      }
+    }
+
+    if (!best) {
+      return { ok: false, error: "No se pudo resolver el option del objetivo" };
+    }
+
+    return {
+      ok: true,
+      value: best.value,
+      text: best.text,
+    };
+  }, objectiveName);
+
+  if (!result?.ok) {
+    throw new Error(result?.error || "No se pudo resolver el objetivo para bloqueo");
+  }
+
+  return result;
 }
 
 async function stillOwnLock() {
@@ -330,8 +363,8 @@ async function stillOwnLock() {
   return current && Number(current.pid) === Number(process.pid);
 }
 
-async function lockObjectiveForever(page, selectedValue) {
-  console.log(`Bloqueando objetivo seleccionado indefinidamente: ${selectedValue}`);
+async function lockObjectiveForever(page, objectiveName, selectedValue) {
+  console.log(`Bloqueando objetivo seleccionado indefinidamente: ${objectiveName}`);
 
   while (true) {
     try {
@@ -345,56 +378,66 @@ async function lockObjectiveForever(page, selectedValue) {
         return;
       }
 
-      await page.evaluate((value) => {
-        try {
-          window.autoCenter = false;
-        } catch {}
+      await page.evaluate(
+        async ({ objectiveNameArg, selectedValueArg }) => {
+          try {
+            window.autoCenter = false;
+          } catch {}
 
-        try {
-          window.guardiaSeleccionadoId = null;
-        } catch {}
+          try {
+            window.guardiaSeleccionadoId = null;
+          } catch {}
 
-        try {
-          const chkAuto = document.getElementById("chk-auto-center");
-          if (chkAuto) chkAuto.checked = false;
-        } catch {}
+          try {
+            const chkAuto = document.getElementById("chk-auto-center");
+            if (chkAuto) chkAuto.checked = false;
+          } catch {}
 
-        try {
-          const chkAutoSmart = document.getElementById("chk-auto-smart");
-          if (chkAutoSmart) chkAutoSmart.checked = false;
-        } catch {}
+          try {
+            const chkAutoSmart = document.getElementById("chk-auto-smart");
+            if (chkAutoSmart) chkAutoSmart.checked = false;
+          } catch {}
 
-        try {
-          const filtro = document.getElementById("filtro-objetivo-mapa");
-          if (!filtro) return;
+          try {
+            const select = document.getElementById("filtro-objetivo-mapa");
+            if (select && String(select.value || "") !== String(selectedValueArg || "")) {
+              select.value = String(selectedValueArg || "");
+            }
+          } catch {}
 
-          if (String(filtro.value) !== String(value)) {
-            filtro.value = String(value);
-            filtro.dispatchEvent(new Event("change", { bubbles: true }));
-          }
+          try {
+            if (
+              window.CentinelasAutomation &&
+              typeof window.CentinelasAutomation.showObjectiveByName === "function"
+            ) {
+              await window.CentinelasAutomation.showObjectiveByName(objectiveNameArg);
+              return;
+            }
+          } catch {}
 
-          const id = filtro.value || "";
-          if (!id) return;
+          try {
+            if (
+              window.CentinelasMapAutomation &&
+              typeof window.CentinelasMapAutomation.focusObjectiveByName === "function"
+            ) {
+              await window.CentinelasMapAutomation.focusObjectiveByName(objectiveNameArg, {
+                zoom: 16,
+                source: "agent_lock_objective",
+              });
+              return;
+            }
+          } catch {}
 
-          const obj =
-            typeof window.findObjetivo === "function"
-              ? window.findObjetivo(id)
-              : (window.objetivos || []).find((o) => String(o?.id) === String(id));
-
-          if (!obj || obj.lat == null || obj.lng == null || !window.map) return;
-
-          if (typeof window.map.setView === "function") {
-            window.map.setView([obj.lat, obj.lng], 17);
-          }
-
-          if (typeof window.renderObjetivosAdmin === "function") {
-            window.renderObjetivosAdmin();
-          }
-          if (typeof window.renderDispositivosAdmin === "function") {
-            window.renderDispositivosAdmin();
-          }
-        } catch {}
-      }, selectedValue);
+          try {
+            const filtro = document.getElementById("filtro-objetivo-mapa");
+            if (filtro && String(filtro.value || "") !== String(selectedValueArg || "")) {
+              filtro.value = String(selectedValueArg || "");
+              filtro.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+          } catch {}
+        },
+        { objectiveNameArg: objectiveName, selectedValueArg: selectedValue }
+      );
 
       await sleep(1500);
     } catch (err) {
@@ -421,15 +464,16 @@ async function main() {
   await attachDialogHandler(page);
   await resetPanel(page, panelUrl);
   await disableAutoCenterAndClearGuard(page);
+  await waitForAutomationReady(page);
 
-  const selected = await selectObjectiveInDropdown(page, objectiveName);
-  await centerSelectedObjective(page);
+  const focused = await focusObjectiveWithStableApi(page, objectiveName);
+  const selected = await resolveObjectiveValueForLock(page, objectiveName);
 
   console.log(
-    `OK objetivo mostrado: ${objectiveName} -> ${selected.text} (${selected.value})`
+    `OK objetivo mostrado: ${objectiveName} -> ${selected.text} (${selected.value}) via ${focused.source}`
   );
 
-  await lockObjectiveForever(page, selected.value);
+  await lockObjectiveForever(page, objectiveName, selected.value);
 }
 
 main().catch((err) => {
