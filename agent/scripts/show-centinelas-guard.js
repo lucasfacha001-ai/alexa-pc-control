@@ -70,7 +70,7 @@ async function acquireSingleInstanceLock(guardName) {
     if (isProcessAlive(Number(existing.pid))) {
       console.log(`Detecté un bloqueo anterior activo (${existing.pid}). Lo voy a cerrar.`);
       killPreviousProcess(Number(existing.pid));
-      await sleep(1500);
+      await sleep(1200);
     }
   }
 
@@ -164,7 +164,7 @@ async function resetPanel(page, panelUrl) {
     });
   }
 
-  await sleep(5000);
+  await sleep(3500);
 
   await safeClick(page, [
     'button:has-text("Cerrar")',
@@ -209,8 +209,81 @@ async function waitForAutomationReady(page) {
   }, { timeout: 30000 });
 }
 
-async function focusGuardWithStableApi(page, guardName) {
-  const result = await page.evaluate(async (name) => {
+async function resolveGuardCandidates(page, guardName) {
+  const result = await page.evaluate((name) => {
+    const normalize = (value) => {
+      try {
+        return String(value || "")
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      } catch {
+        return String(value || "").toLowerCase().trim();
+      }
+    };
+
+    const getName = (d) =>
+      String(
+        d?.nombre ?? d?.name ?? d?.guardiaNombre ?? d?.alias ?? d?.displayName ?? ""
+      ).trim();
+
+    const getId = (d) =>
+      String(d?.id ?? d?.dispositivoId ?? d?.guardiaId ?? "").replace(/[^\d]/g, "");
+
+    const target = normalize(name);
+    const devices = Array.isArray(window.dispositivos) ? window.dispositivos : [];
+
+    const candidates = devices
+      .map((d) => {
+        const label = getName(d);
+        const txt = normalize(label);
+        if (!txt) return null;
+
+        let score = -1;
+        if (txt === target) score = 100;
+        else if (txt.startsWith(target)) score = 80;
+        else if (txt.includes(target)) score = 60;
+        else if (target.includes(txt) && txt.length > 3) score = 40;
+
+        if (score < 0) return null;
+
+        return {
+          id: getId(d),
+          nombre: label,
+          score,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score || a.nombre.localeCompare(b.nombre));
+
+    const bestScore = candidates.length ? candidates[0].score : -1;
+    const best = candidates.filter((c) => c.score === bestScore);
+
+    return {
+      candidates: best.slice(0, 10),
+    };
+  }, guardName);
+
+  const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
+  if (!candidates.length) {
+    throw new Error(`No encontré al guardia ${guardName}.`);
+  }
+
+  const distinctIds = [...new Set(candidates.map((c) => c.id).filter(Boolean))];
+  if (distinctIds.length > 1) {
+    const labels = candidates.map((c) => `${c.nombre} (${c.id || "sin-id"})`);
+    throw new Error(
+      `Encontré varios guardias para "${guardName}": ${labels.slice(0, 4).join(", ")}. Usa un nombre más específico.`
+    );
+  }
+
+  return candidates[0];
+}
+
+async function focusGuardWithStableApi(page, candidate) {
+  const result = await page.evaluate(async ({ guardName, guardId }) => {
     const response = {
       ok: false,
       source: null,
@@ -228,11 +301,25 @@ async function focusGuardWithStableApi(page, guardName) {
         } catch {}
       }
 
+      if (guardId && typeof window.selectGuardiaUnified === "function") {
+        const d = await window.selectGuardiaUnified(guardId, {
+          source: "agent_show_centinelas_guard",
+          zoom: 17,
+          center: true,
+        });
+        if (d) {
+          response.ok = true;
+          response.source = "selectGuardiaUnified";
+          response.detail = d;
+          return response;
+        }
+      }
+
       if (
         window.CentinelasAutomation &&
         typeof window.CentinelasAutomation.showGuardByName === "function"
       ) {
-        const r = await window.CentinelasAutomation.showGuardByName(name);
+        const r = await window.CentinelasAutomation.showGuardByName(guardName);
         response.ok = !!r?.ok;
         response.source = "CentinelasAutomation.showGuardByName";
         response.detail = r || null;
@@ -243,7 +330,7 @@ async function focusGuardWithStableApi(page, guardName) {
         window.CentinelasMapAutomation &&
         typeof window.CentinelasMapAutomation.focusGuardByName === "function"
       ) {
-        const r = await window.CentinelasMapAutomation.focusGuardByName(name, {
+        const r = await window.CentinelasMapAutomation.focusGuardByName(guardName, {
           zoom: 17,
           source: "agent_show_centinelas_guard",
         });
@@ -254,7 +341,7 @@ async function focusGuardWithStableApi(page, guardName) {
       }
 
       if (typeof window.selectGuardiaByName === "function") {
-        const d = await window.selectGuardiaByName(name, {
+        const d = await window.selectGuardiaByName(guardName, {
           source: "agent_show_centinelas_guard",
           zoom: 17,
           center: true,
@@ -272,7 +359,7 @@ async function focusGuardWithStableApi(page, guardName) {
       response.error = err?.message || String(err);
       return response;
     }
-  }, guardName);
+  }, { guardName: candidate.nombre, guardId: candidate.id });
 
   if (!result?.ok) {
     throw new Error(result?.error || "No se pudo enfocar el guardia con la API estable");
@@ -281,100 +368,21 @@ async function focusGuardWithStableApi(page, guardName) {
   return result;
 }
 
-async function resolveSelectedGuardId(page) {
-  const result = await page.evaluate(() => {
-    const id = String(window.guardiaSeleccionadoId || "").replace(/[^\d]/g, "");
-    if (!id) {
-      return { ok: false, error: "No hay guardia seleccionado" };
-    }
-    return { ok: true, id };
-  });
-
-  if (!result?.ok) {
-    throw new Error(result?.error || "No se pudo resolver guardia seleccionado");
-  }
-
-  return result.id;
-}
-
-async function stillOwnLock() {
-  const current = readLockFile();
-  return current && Number(current.pid) === Number(process.pid);
-}
-
-async function lockGuardForever(page, guardName, guardId) {
-  console.log(`Bloqueando guardia seleccionado indefinidamente: ${guardName}`);
-
-  while (true) {
+async function stabilizeOnce(page) {
+  await page.evaluate(() => {
     try {
-      if (!(await stillOwnLock())) {
-        console.log("Otro guardia tomó el control. Terminando este bloqueo.");
-        return;
-      }
-
-      if (page.isClosed()) {
-        console.log("La página se cerró. Terminando bloqueo.");
-        return;
-      }
-
-      await page.evaluate(
-        async ({ guardNameArg, guardIdArg }) => {
-          try {
-            window.autoCenter = false;
-          } catch {}
-
-          try {
-            const chkAuto = document.getElementById("chk-auto-center");
-            if (chkAuto) chkAuto.checked = false;
-          } catch {}
-
-          try {
-            const chkAutoSmart = document.getElementById("chk-auto-smart");
-            if (chkAutoSmart) chkAutoSmart.checked = false;
-          } catch {}
-
-          try {
-            if (
-              window.CentinelasAutomation &&
-              typeof window.CentinelasAutomation.showGuardByName === "function"
-            ) {
-              await window.CentinelasAutomation.showGuardByName(guardNameArg);
-              return;
-            }
-          } catch {}
-
-          try {
-            if (
-              window.CentinelasMapAutomation &&
-              typeof window.CentinelasMapAutomation.focusGuardByName === "function"
-            ) {
-              await window.CentinelasMapAutomation.focusGuardByName(guardNameArg, {
-                zoom: 17,
-                source: "agent_lock_guard",
-              });
-              return;
-            }
-          } catch {}
-
-          try {
-            if (typeof window.selectGuardiaUnified === "function") {
-              window.selectGuardiaUnified(guardIdArg, {
-                source: "agent_lock_guard",
-                zoom: 17,
-                center: true,
-              });
-            }
-          } catch {}
-        },
-        { guardNameArg: guardName, guardIdArg: guardId }
-      );
-
-      await sleep(1500);
-    } catch (err) {
-      console.error("Error manteniendo el guardia fijado:", err.message);
-      await sleep(2000);
-    }
-  }
+      window.autoCenter = false;
+    } catch {}
+    try {
+      const chkAuto = document.getElementById("chk-auto-center");
+      if (chkAuto) chkAuto.checked = false;
+    } catch {}
+    try {
+      const chkAutoSmart = document.getElementById("chk-auto-smart");
+      if (chkAutoSmart) chkAutoSmart.checked = false;
+    } catch {}
+  });
+  await sleep(700);
 }
 
 async function main() {
@@ -396,14 +404,17 @@ async function main() {
   await disableAutoCenter(page);
   await waitForAutomationReady(page);
 
-  const focused = await focusGuardWithStableApi(page, guardName);
-  const selectedGuardId = await resolveSelectedGuardId(page);
+  const candidate = await resolveGuardCandidates(page, guardName);
+  const focused = await focusGuardWithStableApi(page, candidate);
+  await stabilizeOnce(page);
 
   console.log(
-    `OK guardia mostrado: ${guardName} (${selectedGuardId}) via ${focused.source}`
+    `OK guardia mostrado: ${candidate.nombre} (${candidate.id || "sin-id"}) via ${focused.source}`
   );
 
-  await lockGuardForever(page, guardName, selectedGuardId);
+  await sleep(1200);
+  removeLockFileIfOwned();
+  process.exit(0);
 }
 
 main().catch((err) => {

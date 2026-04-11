@@ -11,15 +11,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function normalizeText(value) {
-  return String(value || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function readLockFile() {
   try {
     if (!fs.existsSync(LOCK_FILE)) return null;
@@ -79,7 +70,7 @@ async function acquireSingleInstanceLock(objectiveName) {
     if (isProcessAlive(Number(existing.pid))) {
       console.log(`Detecté un bloqueo anterior activo (${existing.pid}). Lo voy a cerrar.`);
       killPreviousProcess(Number(existing.pid));
-      await sleep(1500);
+      await sleep(1200);
     }
   }
 
@@ -173,7 +164,7 @@ async function resetPanel(page, panelUrl) {
     });
   }
 
-  await sleep(5000);
+  await sleep(3500);
 
   await safeClick(page, [
     'button:has-text("Cerrar")',
@@ -204,19 +195,15 @@ async function disableAutoCenterAndClearGuard(page) {
     } catch {}
 
     try {
-      if (typeof window.renderDispositivosAdmin === "function") {
-        window.renderDispositivosAdmin();
-      }
+      window.renderDispositivosAdmin?.();
     } catch {}
 
     try {
-      if (typeof window.renderObjetivosAdmin === "function") {
-        window.renderObjetivosAdmin();
-      }
+      window.renderObjetivosAdmin?.();
     } catch {}
   });
 
-  await sleep(800);
+  await sleep(500);
 }
 
 async function waitForAutomationReady(page) {
@@ -231,10 +218,75 @@ async function waitForAutomationReady(page) {
       !!window.CentinelasMapAutomation &&
       typeof window.CentinelasMapAutomation.focusObjectiveByName === "function";
 
-    const objectivesReady = Array.isArray(window.objetivos);
-
-    return mapReady && objectivesReady && (centinelasReady || mapAutomationReady);
+    return mapReady && Array.isArray(window.objetivos) && (centinelasReady || mapAutomationReady);
   }, { timeout: 30000 });
+}
+
+async function resolveObjectiveCandidates(page, objectiveName) {
+  const result = await page.evaluate((name) => {
+    const normalize = (value) => {
+      try {
+        return String(value || "")
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      } catch {
+        return String(value || "").toLowerCase().trim();
+      }
+    };
+
+    const target = normalize(name);
+    const objectives = Array.isArray(window.objetivos) ? window.objetivos : [];
+
+    const candidates = objectives
+      .map((o) => {
+        const label = String(
+          o?.nombre ?? o?.name ?? o?.objetivoNombre ?? o?.titulo ?? o?.label ?? ""
+        ).trim();
+        const txt = normalize(label);
+        if (!txt) return null;
+
+        let score = -1;
+        if (txt === target) score = 100;
+        else if (txt.startsWith(target)) score = 80;
+        else if (txt.includes(target)) score = 60;
+        else if (target.includes(txt) && txt.length > 3) score = 40;
+
+        if (score < 0) return null;
+
+        return {
+          id: String(o?.id ?? ""),
+          nombre: label,
+          score,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score || a.nombre.localeCompare(b.nombre));
+
+    const bestScore = candidates.length ? candidates[0].score : -1;
+    const best = candidates.filter((c) => c.score === bestScore);
+
+    return {
+      target,
+      candidates: best.slice(0, 10),
+    };
+  }, objectiveName);
+
+  const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
+  if (!candidates.length) {
+    throw new Error(`No encontré el objetivo ${objectiveName}.`);
+  }
+
+  const distinctNames = [...new Set(candidates.map((c) => c.nombre))];
+  if (distinctNames.length > 1) {
+    throw new Error(
+      `El nombre "${objectiveName}" coincide con varios objetivos: ${distinctNames.slice(0, 4).join(", ")}. Usa un nombre más específico.`
+    );
+  }
+
+  return candidates[0];
 }
 
 async function focusObjectiveWithStableApi(page, objectiveName) {
@@ -295,156 +347,21 @@ async function focusObjectiveWithStableApi(page, objectiveName) {
   return result;
 }
 
-async function resolveObjectiveValueForLock(page, objectiveName) {
-  const result = await page.evaluate((name) => {
-    const normalize = (value) => {
-      try {
-        return String(value || "")
-          .toLowerCase()
-          .normalize("NFD")
-          .replace(/[\u0300-\u036f]/g, "")
-          .replace(/\s+/g, " ")
-          .trim();
-      } catch {
-        return String(value || "").toLowerCase().trim();
-      }
-    };
-
-    const target = normalize(name);
-    const select = document.getElementById("filtro-objetivo-mapa");
-    if (!select || !select.options) {
-      return { ok: false, error: "No existe #filtro-objetivo-mapa" };
-    }
-
-    const options = Array.from(select.options || []).map((opt) => ({
-      value: String(opt.value || "").trim(),
-      text: String(opt.textContent || "").trim(),
-    }));
-
-    let best = null;
-    let bestScore = -1;
-
-    for (const opt of options) {
-      const txt = normalize(opt.text);
-      if (!txt || !opt.value) continue;
-
-      let score = -1;
-      if (txt === target) score = 100;
-      else if (txt.startsWith(target)) score = 80;
-      else if (txt.includes(target)) score = 60;
-      else if (target.includes(txt) && txt.length > 3) score = 40;
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = opt;
-      }
-    }
-
-    if (!best) {
-      return { ok: false, error: "No se pudo resolver el option del objetivo" };
-    }
-
-    return {
-      ok: true,
-      value: best.value,
-      text: best.text,
-    };
-  }, objectiveName);
-
-  if (!result?.ok) {
-    throw new Error(result?.error || "No se pudo resolver el objetivo para bloqueo");
-  }
-
-  return result;
-}
-
-async function stillOwnLock() {
-  const current = readLockFile();
-  return current && Number(current.pid) === Number(process.pid);
-}
-
-async function lockObjectiveForever(page, objectiveName, selectedValue) {
-  console.log(`Bloqueando objetivo seleccionado indefinidamente: ${objectiveName}`);
-
-  while (true) {
+async function stabilizeOnce(page) {
+  await page.evaluate(() => {
     try {
-      if (!(await stillOwnLock())) {
-        console.log("Otro objetivo tomó el control. Terminando este bloqueo.");
-        return;
-      }
-
-      if (page.isClosed()) {
-        console.log("La página se cerró. Terminando bloqueo.");
-        return;
-      }
-
-      await page.evaluate(
-        async ({ objectiveNameArg, selectedValueArg }) => {
-          try {
-            window.autoCenter = false;
-          } catch {}
-
-          try {
-            window.guardiaSeleccionadoId = null;
-          } catch {}
-
-          try {
-            const chkAuto = document.getElementById("chk-auto-center");
-            if (chkAuto) chkAuto.checked = false;
-          } catch {}
-
-          try {
-            const chkAutoSmart = document.getElementById("chk-auto-smart");
-            if (chkAutoSmart) chkAutoSmart.checked = false;
-          } catch {}
-
-          try {
-            const select = document.getElementById("filtro-objetivo-mapa");
-            if (select && String(select.value || "") !== String(selectedValueArg || "")) {
-              select.value = String(selectedValueArg || "");
-            }
-          } catch {}
-
-          try {
-            if (
-              window.CentinelasAutomation &&
-              typeof window.CentinelasAutomation.showObjectiveByName === "function"
-            ) {
-              await window.CentinelasAutomation.showObjectiveByName(objectiveNameArg);
-              return;
-            }
-          } catch {}
-
-          try {
-            if (
-              window.CentinelasMapAutomation &&
-              typeof window.CentinelasMapAutomation.focusObjectiveByName === "function"
-            ) {
-              await window.CentinelasMapAutomation.focusObjectiveByName(objectiveNameArg, {
-                zoom: 16,
-                source: "agent_lock_objective",
-              });
-              return;
-            }
-          } catch {}
-
-          try {
-            const filtro = document.getElementById("filtro-objetivo-mapa");
-            if (filtro && String(filtro.value || "") !== String(selectedValueArg || "")) {
-              filtro.value = String(selectedValueArg || "");
-              filtro.dispatchEvent(new Event("change", { bubbles: true }));
-            }
-          } catch {}
-        },
-        { objectiveNameArg: objectiveName, selectedValueArg: selectedValue }
-      );
-
-      await sleep(1500);
-    } catch (err) {
-      console.error("Error manteniendo el objetivo fijado:", err.message);
-      await sleep(2000);
-    }
-  }
+      window.autoCenter = false;
+    } catch {}
+    try {
+      const chkAuto = document.getElementById("chk-auto-center");
+      if (chkAuto) chkAuto.checked = false;
+    } catch {}
+    try {
+      const chkAutoSmart = document.getElementById("chk-auto-smart");
+      if (chkAutoSmart) chkAutoSmart.checked = false;
+    } catch {}
+  });
+  await sleep(700);
 }
 
 async function main() {
@@ -466,14 +383,17 @@ async function main() {
   await disableAutoCenterAndClearGuard(page);
   await waitForAutomationReady(page);
 
-  const focused = await focusObjectiveWithStableApi(page, objectiveName);
-  const selected = await resolveObjectiveValueForLock(page, objectiveName);
+  const candidate = await resolveObjectiveCandidates(page, objectiveName);
+  const focused = await focusObjectiveWithStableApi(page, candidate.nombre);
+  await stabilizeOnce(page);
 
   console.log(
-    `OK objetivo mostrado: ${objectiveName} -> ${selected.text} (${selected.value}) via ${focused.source}`
+    `OK objetivo mostrado: ${candidate.nombre} (${candidate.id || "sin-id"}) via ${focused.source}`
   );
 
-  await lockObjectiveForever(page, objectiveName, selected.value);
+  await sleep(1200);
+  removeLockFileIfOwned();
+  process.exit(0);
 }
 
 main().catch((err) => {
